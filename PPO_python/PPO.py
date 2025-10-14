@@ -50,9 +50,6 @@ class ActorCritic(nn.Module):
 
         if has_continuous_action_space:
             self.action_dim = action_dim
-            # self.action_var = torch.full(
-            #     (action_dim,), action_std_init * action_std_init
-            # ).to(device)
             self.log_std = nn.Parameter(
                 torch.full((action_dim,), np.log(action_std_init), dtype=torch.float32)
             )
@@ -96,11 +93,11 @@ class ActorCritic(nn.Module):
 
     def act(self, state):
         if self.has_continuous_action_space:
-            action_mean = self.actor(state)  # [A] 또는 [B, A]
-            log_std = torch.clamp(self.log_std, -5.0, 2.0)  # ★ 폭주 방지
+            action_mean = self.actor(state)  
+            log_std = torch.clamp(self.log_std, -5.0, 2.0) 
             std = log_std.exp()
             if action_mean.dim() == 1:
-                cov = torch.diag(std**2)  # [A, A]
+                cov = torch.diag(std**2) 
             else:
                 cov = torch.diag_embed(std**2).expand(action_mean.size(0), -1, -1)
             dist = MultivariateNormal(action_mean, cov)

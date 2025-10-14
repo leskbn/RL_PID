@@ -65,7 +65,7 @@ def test():
     # preTrained weights directory
 
     random_seed = (
-        0  #### set this to load a particular checkpoint trained on random seed
+        1234  #### set this to load a particular checkpoint trained on random seed
     )
     run_num_pretrained = 0  #### set this to load a particular checkpoint num
 

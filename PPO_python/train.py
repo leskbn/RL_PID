@@ -62,7 +62,7 @@ def train():
     is_box = isinstance(env.action_space, gym.spaces.Box)
     has_continuous_action_space = is_box
 
-    # ★ 연속이면: 에이전트 [-1,1] → env.low/high 로 자동 매핑
+    # 연속이면: 에이전트 [-1,1] → env.low/high 로 자동 매핑
     if is_box:
         env = RescaleAction(env, -1.0, 1.0)
         env = ClipAction(env)
