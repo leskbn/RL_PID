@@ -52,7 +52,7 @@ def train():
     lr_actor = 0.0003  # learning rate for actor network
     lr_critic = 0.001  # learning rate for critic network
 
-    random_seed = 0  # set random seed if required (0 = no random seed)
+    random_seed = 1234  # set random seed if required (0 = no random seed)
     #####################################################
 
     print("training environment name : " + env_name)
@@ -166,13 +166,16 @@ def train():
     print("optimizer learning rate actor : ", lr_actor)
     print("optimizer learning rate critic : ", lr_critic)
     if random_seed:
-        print(
-            "--------------------------------------------------------------------------------------------"
-        )
         print("setting random seed to ", random_seed)
         torch.manual_seed(random_seed)
-        env.seed(random_seed)
         np.random.seed(random_seed)
+        try:
+            # Gymnasium 방식
+            env.reset(seed=random_seed)
+            env.action_space.seed(random_seed)
+            env.observation_space.seed(random_seed)
+        except Exception:
+            pass  # 구버전 호환용
     #####################################################
 
     print(
