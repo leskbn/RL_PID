@@ -7,7 +7,7 @@ import torch
 import numpy as np
 from PIL import Image
 
-import gymnasium
+import gymnasium as gym
 
 from PPO import PPO
 
