@@ -19,9 +19,9 @@ def test():
 
     ################## hyperparameters ##################
 
-    env_name = "Pendulum-v1"
+    env_name = "BipedalWalker-v3"
     has_continuous_action_space = True
-    max_ep_len = 400
+    max_ep_len = 2000
     action_std = 0.6
 
     render = True  # render environment on screen
@@ -29,7 +29,7 @@ def test():
 
     total_test_episodes = 10  # total num of testing episodes
 
-    K_epochs = 20  # update policy for K epochs
+    K_epochs = 10  # update policy for K epochs
     eps_clip = 0.2  # clip parameter for PPO
     gamma = 0.99  # discount factor
 
@@ -38,7 +38,7 @@ def test():
 
     #####################################################
 
-    env = gym.make(env_name, render_mode="human")
+    env = gym.make(env_name, hardcore=True, render_mode="human")
 
     # state space dimension
     state_dim = env.observation_space.shape[0]

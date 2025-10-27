@@ -4,6 +4,54 @@ from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
 import numpy as np
 
+
+class RunningMeanStd:
+    def __init__(self, shape, eps=1e-5):
+        # CPU에 통계 저장 (안전하고 가벼움)
+        if isinstance(shape, int):
+            shape = (shape,)
+        self.mean = torch.zeros(shape, dtype=torch.float32)
+        self.var = torch.ones(shape, dtype=torch.float32)
+        self.count = eps
+
+    @torch.no_grad()
+    def update(self, x):
+        """
+        x: torch.Tensor on any device, shape (..., D)
+        한 스텝(state) 또는 미니배치 모두 지원
+        """
+        x = x.detach().to("cpu")
+        if x.dim() == 1:
+            batch_mean = x
+            batch_var = torch.zeros_like(x)
+            batch_count = 1.0
+        else:
+            # 마지막 차원을 feature로 간주
+            batch_mean = x.mean(dim=0)
+            batch_var = x.var(dim=0, unbiased=False)
+            batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * (batch_count / tot_count)
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta.pow(2) * self.count * batch_count / tot_count
+
+        self.mean = new_mean
+        self.var = M2 / tot_count
+        self.count = tot_count
+
+    def normalize(self, x):
+        # x: torch.Tensor on device
+        m = self.mean.to(x.device)
+        s = (self.var.to(x.device).clamp_min(1e-8)).sqrt()
+        z = (x - m) / s
+        # 과도한 값 방지 (선택)
+        return torch.clamp(z, -5.0, 5.0)
+
+
 ################################## set device ##################################
 print(
     "============================================================================================"
@@ -29,7 +77,10 @@ class RolloutBuffer:
         self.logprobs = []
         self.rewards = []
         self.state_values = []
-        self.is_terminals = []
+        self.is_terminals = []  # true 종료(terminated)
+        self.is_timeouts = []  # 시간초과(truncated)
+        self.timeout_bootstrap = []
+        self.last_value = None  # 롤아웃 마지막 V(s_T) 저장용
 
     def clear(self):
         del self.actions[:]
@@ -38,6 +89,9 @@ class RolloutBuffer:
         del self.rewards[:]
         del self.state_values[:]
         del self.is_terminals[:]
+        del self.is_timeouts[:]
+        del self.timeout_bootstrap[:]
+        self.last_value = None
 
 
 class ActorCritic(nn.Module):
@@ -56,12 +110,11 @@ class ActorCritic(nn.Module):
         # actor
         if has_continuous_action_space:
             self.actor = nn.Sequential(
-                nn.Linear(state_dim, 64),
+                nn.Linear(state_dim, 32),
                 nn.Tanh(),
-                nn.Linear(64, 64),
+                nn.Linear(32, 32),
                 nn.Tanh(),
-                nn.Linear(64, action_dim),
-                nn.Tanh(),
+                nn.Linear(32, action_dim),
             )
         else:
             self.actor = nn.Sequential(
@@ -74,11 +127,11 @@ class ActorCritic(nn.Module):
             )
         # critic
         self.critic = nn.Sequential(
-            nn.Linear(state_dim, 64),
+            nn.Linear(state_dim, 32),
             nn.Tanh(),
-            nn.Linear(64, 64),
+            nn.Linear(32, 32),
             nn.Tanh(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
         )
 
     def set_action_std(self, new_action_std):
@@ -93,14 +146,20 @@ class ActorCritic(nn.Module):
 
     def act(self, state):
         if self.has_continuous_action_space:
-            action_mean = self.actor(state)  
-            log_std = torch.clamp(self.log_std, -5.0, 2.0) 
-            std = log_std.exp()
-            if action_mean.dim() == 1:
-                cov = torch.diag(std**2) 
-            else:
-                cov = torch.diag_embed(std**2).expand(action_mean.size(0), -1, -1)
-            dist = MultivariateNormal(action_mean, cov)
+            mu = self.actor(state)  # unbounded
+            log_std = torch.clamp(self.log_std, -5.0, 2.0)
+            std = log_std.exp().expand_as(mu)
+            # 독립정규(각 차원)
+            dist = torch.distributions.Normal(mu, std)
+
+            u = dist.rsample()  # reparameterized
+            a = torch.tanh(u)
+            # log_prob 보정: sum over dims
+            log_prob_u = dist.log_prob(u).sum(dim=-1)
+            log_prob = log_prob_u - torch.log(1 - a.pow(2) + 1e-6).sum(dim=-1)
+
+            state_val = self.critic(state)
+            return a.detach(), log_prob.detach(), state_val.detach()
         else:
             action_probs = self.actor(state)
             dist = Categorical(action_probs)
@@ -112,16 +171,20 @@ class ActorCritic(nn.Module):
 
     def evaluate(self, state, action):
         if self.has_continuous_action_space:
-            action_mean = self.actor(state)
-
+            mu = self.actor(state)  # unbounded
             log_std = torch.clamp(self.log_std, -5.0, 2.0)
-            std = log_std.exp().expand_as(action_mean)
-            cov_mat = torch.diag_embed(std**2)
+            std = log_std.exp().expand_as(mu)
+            dist = torch.distributions.Normal(mu, std)
 
-            dist = MultivariateNormal(action_mean, cov_mat)
+            a = torch.clamp(action, -1 + 1e-6, 1 - 1e-6)
+            u = 0.5 * torch.log((1 + a) / (1 - a))  # atanh(a)
 
-            if self.action_dim == 1:
-                action = action.reshape(-1, self.action_dim)
+            log_prob_u = dist.log_prob(u).sum(dim=-1)
+            log_prob = log_prob_u - torch.log(1 - a.pow(2) + 1e-6).sum(dim=-1)
+
+            state_values = self.critic(state)
+            dist_entropy = dist.entropy().sum(dim=-1)  # 각 차원 합
+            return log_prob, state_values, dist_entropy
         else:
             action_probs = self.actor(state)
             dist = Categorical(action_probs)
@@ -165,6 +228,7 @@ class PPO:
         self.optimizer = torch.optim.Adam(
             [
                 {"params": self.policy.actor.parameters(), "lr": lr_actor},
+                {"params": [self.policy.log_std], "lr": lr_actor},
                 {"params": self.policy.critic.parameters(), "lr": lr_critic},
             ]
         )
@@ -175,6 +239,8 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.MseLoss = nn.MSELoss()
+
+        self.obs_rms = RunningMeanStd(shape=state_dim)
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -214,21 +280,22 @@ class PPO:
     def select_action(self, state):
         with torch.no_grad():
             state_t = torch.as_tensor(state, dtype=torch.float32, device=device)
-            action, action_logprob, state_val = self.policy_old.act(state_t)
+            self.obs_rms.update(state_t)
+            s_norm = self.obs_rms.normalize(state_t)
 
-        self.buffer.states.append(state_t)
+            action, action_logprob, state_val = self.policy_old.act(s_norm)
+
+        self.buffer.states.append(s_norm)
+        self.buffer.logprobs.append(action_logprob)
+        self.buffer.state_values.append(state_val)
 
         if self.has_continuous_action_space:
             self.buffer.actions.append(action)
-            out = action.detach().cpu().numpy().flatten()
+            return action.detach().cpu().numpy().flatten()
         else:
             act_int = int(action.item())
             self.buffer.actions.append(torch.as_tensor(act_int))
-            out = act_int
-
-        self.buffer.logprobs.append(action_logprob)
-        self.buffer.state_values.append(state_val)
-        return out
+            return act_int
 
     def update(
         self,
@@ -236,7 +303,7 @@ class PPO:
         ent_coef: float = 0.01,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
-        minibatch_size: int = None,
+        minibatch_size: int = 256,
         target_kl: float = None,
     ):
         # 텐서화
@@ -247,9 +314,15 @@ class PPO:
             torch.stack(self.buffer.state_values, dim=0).detach().to(device).squeeze(-1)
         )
         rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32, device=device)
-        dones = torch.tensor(
+        dones_term = torch.tensor(
             self.buffer.is_terminals, dtype=torch.float32, device=device
-        )  # 1.0 if done
+        )
+        timeouts = torch.tensor(
+            self.buffer.is_timeouts, dtype=torch.float32, device=device
+        )
+        tb = torch.tensor(
+            self.buffer.timeout_bootstrap, dtype=torch.float32, device=device
+        )
 
         if not self.has_continuous_action_space:
             old_actions = old_actions.long().view(-1)
@@ -257,14 +330,29 @@ class PPO:
         # --- GAE(λ)
         T = rewards.size(0)
         advantages = torch.zeros(T, dtype=torch.float32, device=device)
+
+        # ★ 롤아웃 끝의 V(s_T)로 부트스트랩할 값
+        last_v = (
+            self.buffer.last_value
+            if self.buffer.last_value is not None
+            else torch.zeros((), device=device)
+        )  # (안 세팅됐으면 0으로라도)
+
         last_gae = 0.0
         for t in reversed(range(T)):
-            next_value = 0.0 if t == T - 1 or dones[t] > 0.5 else old_values[t + 1]
-            delta = (
-                rewards[t] + self.gamma * next_value * (1.0 - dones[t]) - old_values[t]
-            )
-            last_gae = delta + self.gamma * gae_lambda * (1.0 - dones[t]) * last_gae
+            # 다음 상태의 V: 마지막 스텝은 last_v, 그 외엔 old_values[t+1]
+            if t == T - 1:
+                next_value = last_v
+            elif timeouts[t] > 0.5:
+                next_value = tb[t]
+            else:
+                next_value = old_values[t + 1]
+
+            nonterminal = 1.0 - dones_term[t]  # terminated일 때만 0으로 컷
+            delta = rewards[t] + self.gamma * next_value * nonterminal - old_values[t]
+            last_gae = delta + self.gamma * gae_lambda * nonterminal * last_gae
             advantages[t] = last_gae
+
         returns = advantages + old_values
 
         # --- advantage만 정규화

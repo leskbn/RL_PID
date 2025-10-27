@@ -2,6 +2,9 @@ import os
 import glob
 import time
 from datetime import datetime
+from collections import deque
+
+import matplotlib.pyplot as plt  # ← 추가
 
 import torch
 import numpy as np
@@ -11,6 +14,78 @@ import gymnasium as gym
 from PPO import PPO
 from gymnasium.wrappers import RescaleAction, ClipAction
 
+from envs.pid_dc_motor_env import PIDTuningDCMotorEnv
+
+
+def _mod_device(ppo_agent):
+    # policy_old 파라미터가 올라가 있는 디바이스를 추출
+    return next(ppo_agent.policy_old.parameters()).device
+
+
+def _value_of(ppo_agent, state):
+    dev = _mod_device(ppo_agent)
+    with torch.no_grad():
+        s = torch.as_tensor(state, dtype=torch.float32, device=dev)
+        s_n = ppo_agent.obs_rms.normalize(s)
+        v = ppo_agent.policy_old.critic(s_n).squeeze(-1)
+    return v
+
+
+# --- persistent plot (no flicker) ---
+_PLOT = {"fig": None}
+
+
+def _ensure_plot():
+    if _PLOT["fig"] is not None:
+        return
+    plt.ion()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 4), sharex=True)
+    (lw,) = ax1.plot([], [], label="ω(t)")
+    lref = ax1.axhline(0.0, ls="--", lw=1, color="k", label="ω_ref")
+    (lu,) = ax2.plot([], [], label="u(t)=V")
+    ax1.set_ylabel("ω [rad/s]")
+    ax1.grid(True)
+    ax1.legend(loc="best")
+    ax2.set_ylabel("V [V]")
+    ax2.set_xlabel("time [s]")
+    ax2.grid(True)
+    fig.tight_layout()
+    _PLOT.update(fig=fig, ax1=ax1, ax2=ax2, lw=lw, lu=lu, lref=lref)
+
+
+def _update_plot_episode(info, i_episode=None):
+    if "t" not in info:  # PID 환경 아닐 때 자동 skip
+        return
+    _ensure_plot()
+    t, w, u = info["t"], info["w"], info["u"]
+    wref = info.get("w_ref")
+
+    ax1, ax2 = _PLOT["ax1"], _PLOT["ax2"]
+    _PLOT["lw"].set_data(t, w)
+    _PLOT["lu"].set_data(t, u)
+
+    if wref is not None and len(t) > 0:
+        _PLOT["lref"].set_ydata([wref, wref])
+        _PLOT["lref"].set_xdata([t[0], t[-1]])
+
+    if len(t) > 0:
+        ax1.set_xlim(t[0], t[-1])
+    ax1.relim()
+    ax1.autoscale_view(scalex=False, scaley=True)
+    ax2.relim()
+    ax2.autoscale_view(scalex=False, scaley=True)
+
+    if i_episode is not None:
+        kp, ki, kd = info.get("Kp"), info.get("Ki"), info.get("Kd")
+        if kp is not None and ki is not None and kd is not None:
+            _PLOT["fig"].suptitle(
+                f"Episode {i_episode} | Kp={kp:.3f}, Ki={ki:.3f}, Kd={kd:.3f}"
+            )
+
+    _PLOT["fig"].canvas.draw_idle()
+    _PLOT["fig"].canvas.flush_events()
+    plt.pause(0.001)
+
 
 ################################### Training ###################################
 def train():
@@ -19,11 +94,11 @@ def train():
     )
 
     ####### initialize environment hyperparameters ######
-    env_name = "Pendulum-v1"
+    env_name = "BipedalWalker-v3"
 
     # has_continuous_action_space = True  # continuous action space; else discrete
 
-    max_ep_len = 2000  # max timesteps in one episode
+    max_ep_len = 10  # max timesteps in one episode
     max_training_timesteps = int(
         3e6
     )  # break training loop if timeteps > max_training_timesteps
@@ -33,31 +108,41 @@ def train():
     save_model_freq = int(1e5)  # save model frequency (in num timesteps)
 
     action_std = 0.6  # starting std for action distribution (Multivariate Normal)
-    action_std_decay_rate = 0.05  # linearly decay action_std (action_std = action_std - action_std_decay_rate)
-    min_action_std = (
-        0.1  # minimum action_std (stop decay after action_std <= min_action_std)
-    )
-    action_std_decay_freq = int(2.5e5)  # action_std decay frequency (in num timesteps)
+    # action_std_decay_rate = 0.05  # linearly decay action_std (action_std = action_std - action_std_decay_rate)
+    # min_action_std = (
+    #     0.1  # minimum action_std (stop decay after action_std <= min_action_std)
+    # )
+    # action_std_decay_freq = int(2.5e5)  # action_std decay frequency (in num timesteps)
     #####################################################
 
     ## Note : print/log frequencies should be > than max_ep_len
 
     ################ PPO hyperparameters ################
-    update_timestep = max_ep_len * 4  # update policy every n timesteps
-    K_epochs = 20  # update policy for K epochs in one PPO update
+    update_timestep = max_ep_len * 2  # update policy every n timesteps
+    K_epochs = 5  # update policy for K epochs in one PPO update
 
     eps_clip = 0.2  # clip parameter for PPO
     gamma = 0.99  # discount factor
 
-    lr_actor = 0.0003  # learning rate for actor network
-    lr_critic = 0.001  # learning rate for critic network
+    lr_actor = 3e-4  # learning rate for actor network
+    lr_critic = 3e-4  # learning rate for critic network
 
     random_seed = 1234  # set random seed if required (0 = no random seed)
     #####################################################
 
     print("training environment name : " + env_name)
 
-    env = gym.make(env_name)
+    # env = gym.make(env_name, hardcore=True)
+
+    env = PIDTuningDCMotorEnv(
+        dt=0.01,
+        T_eval=10.0,
+        w_ref=40.0,
+        Vmax=12.0,
+        domain_rand=True,  # 도메인 랜덤화 원하면 True
+        return_history=False,  # 에피소드 끝에 시간응답 히스토리 info로 받기
+        history_stride=2,  # 길면 2~5로 다운샘플
+    )
 
     is_box = isinstance(env.action_space, gym.spaces.Box)
     has_continuous_action_space = is_box
@@ -144,13 +229,6 @@ def train():
             "--------------------------------------------------------------------------------------------"
         )
         print("starting std of action distribution : ", action_std)
-        print("decay rate of std of action distribution : ", action_std_decay_rate)
-        print("minimum std of action distribution : ", min_action_std)
-        print(
-            "decay frequency of std of action distribution : "
-            + str(action_std_decay_freq)
-            + " timesteps"
-        )
     else:
         print("Initializing a discrete action space policy")
     print(
@@ -220,6 +298,8 @@ def train():
     time_step = 0
     i_episode = 0
 
+    last100 = deque(maxlen=100)
+
     # training loop
     while time_step <= max_training_timesteps:
 
@@ -232,19 +312,29 @@ def train():
             raw = ppo_agent.select_action(state)
             action = np.clip(raw, -1.0, 1.0) if is_box else raw  # 연속만 보호용 클립
 
-            state, reward, terminated, truncated, _ = env.step(action)
+            state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
             # saving reward and is_terminals
             ppo_agent.buffer.rewards.append(reward)
-            ppo_agent.buffer.is_terminals.append(done)
+            ppo_agent.buffer.is_terminals.append(float(terminated))  # '진짜 종료'만 컷
+            ppo_agent.buffer.is_timeouts.append(
+                float(truncated)
+            )  # 시간초과는 부트스트랩
+
+            v_next = _value_of(ppo_agent, state)
+            ppo_agent.buffer.timeout_bootstrap.append(
+                float(v_next) if truncated else 0.0
+            )
 
             time_step += 1
             current_ep_reward += reward
 
             # update PPO agent
             if time_step % update_timestep == 0:
-                ppo_agent.update()
+                # 현재 상태(state)는 step 이후의 s_{t+1} 이므로, 이걸로 V(s_{t+1})를 계산해 last_value로 사용
+                ppo_agent.buffer.last_value = _value_of(ppo_agent, state)
+                ppo_agent.update(target_kl=0.02, minibatch_size=256)
 
             # log in logging file
             if time_step % log_freq == 0:
@@ -260,15 +350,17 @@ def train():
                 log_running_episodes = 0
 
             # printing average reward
+            # region
             if time_step % print_freq == 0:
 
                 # print average reward till last episode
                 print_avg_reward = print_running_reward / print_running_episodes
                 print_avg_reward = round(print_avg_reward, 2)
 
+                avg100 = float(np.mean(last100)) if len(last100) > 0 else float("nan")
                 print(
-                    "Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(
-                        i_episode, time_step, print_avg_reward
+                    "Episode : {} \t\t Timestep : {} \t\t Average Reward : {} \t\t Avg100 : {:.2f}".format(
+                        i_episode, time_step, print_avg_reward, avg100
                     )
                 )
 
@@ -290,12 +382,29 @@ def train():
                 print(
                     "--------------------------------------------------------------------------------------------"
                 )
+            # endregion
 
             # break; if the episode is over
             if done:
+
+                if terminated:
+                    # 진짜 종료면 부트스트랩 X → 0
+                    ppo_agent.buffer.last_value = torch.zeros(
+                        (), device=_mod_device(ppo_agent)
+                    )
+                else:
+                    # 시간초과면 V(next)로 부트스트랩 O
+                    ppo_agent.buffer.last_value = _value_of(ppo_agent, state)
+
+                # (선택) 여기서도 업데이트를 한 번 더 강제하고 버퍼를 비워 안정화할 수 있음
+                # if len(ppo_agent.buffer.rewards) > 0:
+                #     ppo_agent.update(target_kl=0.02, minibatch_size=256)
+                _update_plot_episode(info, i_episode)  # ★ 에피소드마다 갱신
+
                 break
 
         print_running_reward += current_ep_reward
+        last100.append(current_ep_reward)
         print_running_episodes += 1
 
         log_running_reward += current_ep_reward
