@@ -1,4 +1,4 @@
-import os
+import os, sys
 import glob
 import time
 from datetime import datetime
@@ -11,7 +11,7 @@ import numpy as np
 
 import gymnasium as gym
 
-from PPO import PPO
+from PPO.PPO import PPO
 from gymnasium.wrappers import RescaleAction, ClipAction
 
 from envs.pid_dc_motor_env import PIDTuningDCMotorEnv
@@ -94,18 +94,18 @@ def train():
     )
 
     ####### initialize environment hyperparameters ######
-    env_name = "BipedalWalker-v3"
+    env_name = "DC_Motor"
 
     # has_continuous_action_space = True  # continuous action space; else discrete
 
-    max_ep_len = 10  # max timesteps in one episode
+    max_ep_len = 1  # max timesteps in one episode
     max_training_timesteps = int(
-        3e6
+        81920
     )  # break training loop if timeteps > max_training_timesteps
 
     print_freq = max_ep_len * 10  # print avg reward in the interval (in num timesteps)
     log_freq = max_ep_len * 2  # log avg reward in the interval (in num timesteps)
-    save_model_freq = int(1e5)  # save model frequency (in num timesteps)
+    save_model_freq = 20000  # save model frequency (in num timesteps)
 
     action_std = 0.6  # starting std for action distribution (Multivariate Normal)
     # action_std_decay_rate = 0.05  # linearly decay action_std (action_std = action_std - action_std_decay_rate)
@@ -118,8 +118,8 @@ def train():
     ## Note : print/log frequencies should be > than max_ep_len
 
     ################ PPO hyperparameters ################
-    update_timestep = max_ep_len * 2  # update policy every n timesteps
-    K_epochs = 5  # update policy for K epochs in one PPO update
+    update_timestep = 1024  # update policy every n timesteps
+    K_epochs = 10  # update policy for K epochs in one PPO update
 
     eps_clip = 0.2  # clip parameter for PPO
     gamma = 0.99  # discount factor
@@ -140,7 +140,7 @@ def train():
         w_ref=40.0,
         Vmax=12.0,
         domain_rand=True,  # 도메인 랜덤화 원하면 True
-        return_history=False,  # 에피소드 끝에 시간응답 히스토리 info로 받기
+        return_history=True,  # 에피소드 끝에 시간응답 히스토리 info로 받기
         history_stride=2,  # 길면 2~5로 다운샘플
     )
 

@@ -2,7 +2,7 @@
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from pid import PID
+from PID.pid import PID
 
 
 # ── DC Motor ────────────────────────────────────────────────────────────────
@@ -60,10 +60,9 @@ def _softplus(x):
 # ── Env ────────────────────────────────────────────────────────────────────
 class PIDTuningDCMotorEnv(gym.Env):
     """
-    action a ∈ [-1,1]^3 → [Kp,Ki,Kd]로 디코딩, 내부에서 T_eval 동안 PID 스텝응답 시뮬.
-    보상: -( w_itae*ITAE + w_settle*(Ts/T) + w_over*overshoot + w_energy*∫u^2 dt )
-    관측: 더미(1,), 에피소드=1 스텝.
-    히스토리(t, w, u, w_ref)는 info로 반환(return_history=True일 때).
+    action a∈[-1,1]^3 → PID 게인, 내부에서 T_eval 동안 스텝응답 시뮬.
+    관측(state): [J,b,Kt,Ke,R,L,Vmax,w_ref] (log10 선택), 에피소드=1 스텝.
+    보상: -(w_itae*ITAE_n + w_settle*(Ts/T) + w_over*over_n + w_energy*Energy_n + w_du*Δu_n)
     """
 
     metadata = {}
@@ -80,11 +79,14 @@ class PIDTuningDCMotorEnv(gym.Env):
         hold_time=0.5,
         w_itae=1.0,
         w_settle=0.3,
-        w_over=0.5,
+        w_over=0.8,
         w_energy=0.05,
         return_history=True,
         history_stride=1,
         normalize_reward=True,
+        w_du=0.01,  # 제어 변화 벌점 가중치
+        use_context_obs=True,
+        ctx_log=True,
     ):
         super().__init__()
         self.dt = float(dt)
@@ -107,19 +109,46 @@ class PIDTuningDCMotorEnv(gym.Env):
         self.return_history = bool(return_history)
         self.history_stride = int(history_stride)
 
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32
-        )
+        self.use_context_obs = bool(use_context_obs)
+        self.ctx_log = bool(ctx_log)
 
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+        if self.use_context_obs:
+            self.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32
+            )
+        else:
+            self.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32
+            )
         self.plant = None
         self.normalize_reward = bool(normalize_reward)
+
+        self.w_du = float(w_du)
 
     # ── env internals ──────────────────────────────────────────────────────
     def _default_params(self):
         return dict(
             J=0.01, b=0.01, Kt=0.1, Ke=0.1, R=1.0, L=0.5, Vmax=self.Vmax, dt=self.dt
         )
+
+    def _build_context_vector(self, params):
+        v = np.array(
+            [
+                params["J"],
+                params["b"],
+                params["Kt"],
+                params["Ke"],
+                params["R"],
+                params["L"],
+                params["Vmax"],
+                self.w_ref,
+            ],
+            dtype=np.float32,
+        )
+        if self.ctx_log:
+            v = np.log10(np.maximum(v, 1e-8))  # 스케일 안정화
+        return v
 
     def _rand_params(self, base):
         def jit(v, s=0.2):
@@ -143,15 +172,25 @@ class PIDTuningDCMotorEnv(gym.Env):
         params = self._rand_params(base) if self.domain_rand else base
         self.plant = _DCMotor(**params)
         self.plant.reset(0.0, 0.0)
-        return np.zeros(1, dtype=np.float32), {}
+        self._ctx = self._build_context_vector(params)  # ← 저장
+        obs0 = self._ctx if self.use_context_obs else np.zeros(1, dtype=np.float32)
+        return obs0, {}
 
-    def _decode_gains(self, a):
+    def _decode_gains(self, a, use_loglin=True):
         a = np.asarray(a, dtype=np.float32)
-        s = np.array([3.0, 3.0, 2.0], dtype=np.float32)
-        b = np.array([0.0, -2.0, -1.0], dtype=np.float32)
-        x = s * a + b
-        K = _softplus(x)  # 양수 보장
-        return float(K[0]), float(K[1]), float(K[2])
+        if use_loglin:
+            Kmins = np.array([1e-3, 1e-3, 1e-5], dtype=np.float32)
+            Kmaxs = np.array([1e2, 1e2, 1e0], dtype=np.float32)
+            t = (a + 1.0) * 0.5  # [-1,1] → [0,1]
+            logK = np.log10(Kmins) + t * (np.log10(Kmaxs) - np.log10(Kmins))
+            K = np.power(10.0, logK)
+            return float(K[0]), float(K[1]), float(K[2])
+        else:
+            s = np.array([3.0, 3.0, 2.0], dtype=np.float32)
+            b = np.array([0.0, -2.0, -1.0], dtype=np.float32)
+            x = s * a + b
+            K = _softplus(x)
+            return float(K[0]), float(K[1]), float(K[2])
 
     def step(self, action):
         Kp, Ki, Kd = self._decode_gains(action)
@@ -172,6 +211,8 @@ class PIDTuningDCMotorEnv(gym.Env):
         in_band_steps = 0
         settled_time = None
         band = self.band_ratio * self.w_ref
+        du_energy = 0.0
+        v_prev = None
 
         # 히스토리 버퍼 (플롯 없음, info로만 반환)
         t_hist, w_hist, u_hist = [], [], []
@@ -183,6 +224,11 @@ class PIDTuningDCMotorEnv(gym.Env):
             v = pid.step(e)
             v = float(np.clip(v, -self.Vmax, self.Vmax))
             self.plant.step(v)
+
+            if v_prev is not None:
+                dv = v - v_prev
+                du_energy += dv * dv
+            v_prev = v
 
             t += self.dt
             itae += t * abs(e) * self.dt
@@ -207,6 +253,12 @@ class PIDTuningDCMotorEnv(gym.Env):
                 itae += 1e3
                 break
 
+        peak_w = max(w_hist) if len(w_hist) > 0 else 0.0
+        over_pct = max(
+            (peak_w - self.w_ref) / max(self.w_ref, 1e-6), 0.0
+        )  # 예: 0.12 = 12%
+        over_n = float(np.clip(over_pct, 0.0, 1.0))  # 보상엔 0~1로 정규화해서 사용
+
         T = self.T_eval
         Ts = settled_time if settled_time is not None else (2 * T)
 
@@ -217,8 +269,8 @@ class PIDTuningDCMotorEnv(gym.Env):
         # 대략적인 기준값(스텝에서 e≈w_ref라 가정하면 ITAE≈0.5*w_ref*T^2)
         ITAE_n = itae / (0.5 * self.w_ref * (T**2) + eps)
         settle_n = Ts / T  # 0~2 정도
-        over_n = float(overshoot)  # 0 or 1
         energy_n = energy / (self.Vmax**2 * T + eps)
+        du_energy_n = du_energy / (((2 * self.Vmax) ** 2) * self.H + 1e-8)
 
         if self.normalize_reward:
             reward = -(
@@ -226,16 +278,18 @@ class PIDTuningDCMotorEnv(gym.Env):
                 + self.w_settle * settle_n
                 + self.w_over * over_n
                 + self.w_energy * energy_n
+                + self.w_du * du_energy_n
             )
         else:
             reward = -(
                 self.w_itae * itae
                 + self.w_settle * (Ts / T)
-                + self.w_over * overshoot
+                + self.w_over * over_pct
                 + self.w_energy * energy
             )
 
-        obs_next = np.zeros(1, dtype=np.float32)
+        obs_next = self._ctx if self.use_context_obs else np.zeros(1, dtype=np.float32)
+
         info = {
             "Kp": Kp,
             "Ki": Ki,
@@ -243,7 +297,10 @@ class PIDTuningDCMotorEnv(gym.Env):
             "itae": itae,
             "settle": Ts,
             "over": overshoot,
+            "over_pct": float(over_pct),
             "energy": energy,
+            "du_energy": float(du_energy),
+            "ctx": self._ctx.copy(),
         }
 
         if self.return_history:
