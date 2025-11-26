@@ -159,7 +159,7 @@ def train():
     ###################### logging ######################
     # region
     #### log files for multiple runs are NOT overwritten
-    log_dir = "PPO_Python/PPO_logs"
+    log_dir = "./PPO/PPO_logs"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
@@ -186,7 +186,7 @@ def train():
         0  #### change this to prevent overwriting weights in same env_name folder
     )
 
-    directory = "PPO_Python/PPO_preTrained"
+    directory = "./PPO/PPO_preTrained"
     if not os.path.exists(directory):
         os.makedirs(directory)
 
